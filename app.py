@@ -307,4 +307,215 @@ with tabs[0]:
         linhas = [{"Código": t.replace(".SA", ""), "Ativo": df.at[t, "nome"], "Setor": df.at[t, "setor"],
                    "Comprar": f"{q} un.", "Preço": brl(df.at[t, "cotacao"]),
                    "Total": brl(q * df.at[t, "cotacao"])} for t, q in compras.items()]
-        st.dataframe(pd.DataFrame(linhas), hide_index=True
+        st.dataframe(pd.DataFrame(linhas), hide_index=True, use_container_width=True)
+        extra = sum(q * df.at[t, "est_prov"] for t, q in compras.items()) / 12
+        c1, c2 = st.columns(2)
+        c1.info(f"💵 Sobra para o próximo aporte: **{brl(saldo)}**")
+        c2.info(f"📈 Renda mensal adicionada pelo plano: **{brl(extra)}**")
+        ok = st.checkbox("Comprei de fato esses ativos (o preço usado é a cotação do Yahoo; "
+                         "ajuste no Histórico se o preço de execução foi diferente)")
+        if st.button("⚡ Efetivar plano", type="primary", disabled=not ok):
+            for t, q in compras.items():
+                registrar(t, q, float(df.at[t, "cotacao"]))
+            D["sobra"] = round(saldo, 2)
+            salvar()
+            st.session_state.msg = "Plano efetivado e sobra guardada para o próximo aporte."
+            st.rerun()
+    else:
+        st.warning("Nenhum ativo qualificado. Relaxe o filtro, aumente a taxa Bazin ou revise as metas.")
+    for m in alertas_concentracao():
+        st.warning("⚖️ " + m)
+    ne = df[(df["meta_pct"] > 0) & ~df["elegivel"] & df["cotacao"].notna()].copy()
+    if not ne.empty:
+        ne["acima"] = (ne["cotacao"] / ne["bazin"] - 1) * 100
+        with st.expander("Fora do critério (lista de espera)"):
+            st.dataframe(ne.sort_values("acima")[["nome", "cotacao", "bazin", "graham", "pvp", "acima"]]
+                         .rename(columns={"nome": "Ativo", "cotacao": "Cotação", "bazin": "Teto Bazin",
+                                          "graham": "Graham", "pvp": "P/VP", "acima": "Acima do Bazin (%)"})
+                         .round(2), use_container_width=True)
+
+# ---- CARTEIRA
+with tabs[1]:
+    pos = df[df["qtd"] > 0].copy()
+    if pos.empty:
+        st.info("Nenhuma posição ainda.")
+    else:
+        pos["Custo"] = pos["qtd"] * pos["pm"]
+        pos["Resultado %"] = (pos["valor_total"] / pos["Custo"] - 1) * 100
+        pos["Renda/mês"] = pos["qtd"] * pos["est_prov"] / 12
+        pos["% Carteira"] = pos["valor_total"] / pat_ativos * 100
+        st.dataframe(pos[["nome", "qtd", "pm", "cotacao", "valor_total", "% Carteira", "Resultado %", "dy",
+                          "Renda/mês"]].rename(columns={"nome": "Ativo", "qtd": "Qtd", "pm": "PM",
+                                                        "cotacao": "Cotação", "valor_total": "Valor",
+                                                        "dy": "DY %"}).round(2), use_container_width=True)
+    c1, c2 = st.columns(2)
+    s = df.groupby("setor")["valor_total"].sum().reset_index()
+    if s["valor_total"].sum() > 0:
+        c1.plotly_chart(px.pie(s, values="valor_total", names="setor", hole=0.4, title="Alocação por setor"),
+                        use_container_width=True)
+    g = df.groupby("empresa").agg(valor=("valor_total", "sum"), meta=("meta_pct", "sum")).reset_index()
+    g["Atual %"] = g["valor"] / pat_ativos * 100 if pat_ativos else 0.0
+    g = g.rename(columns={"meta": "Meta %"})
+    g = g[(g["Meta %"] > 0) | (g["Atual %"] > 0)]
+    c2.plotly_chart(px.bar(g.melt("empresa", ["Atual %", "Meta %"]), x="empresa", y="value", color="variable",
+                            barmode="group", title="Atual vs Meta (%)", labels={"value": "%", "empresa": ""}),
+                    use_container_width=True)
+
+# ---- VALUATION
+with tabs[2]:
+    v = df[["nome", "setor", "cotacao", "bazin", "graham", "pvp", "dy", "status"]].copy()
+    v.columns = ["Empresa", "Setor", "Cotação", "Teto Bazin", "Graham", "P/VP", "DY %", "Diagnóstico"]
+    st.dataframe(v.round(2), use_container_width=True)
+    st.caption("Bazin/Graham são triagem. Graham não se aplica a FIIs; bancos e empresas cíclicas distorcem.")
+
+# ---- CALENDÁRIO
+with tabs[3]:
+    st.subheader("🗓️ Proventos por mês (estimativa)")
+    mat, fallback = {m: 0.0 for m in range(1, 13)}, []
+    for t, r in df[df["qtd"] > 0].iterrows():
+        pm = prov_por_mes(t)
+        if pm:
+            for m, val in pm.items():
+                mat[m] += val * r["qtd"]
+        else:
+            meses = FALLBACK_MESES.get(r["setor"], [3, 6, 9, 12])
+            fallback.append(t.replace(".SA", ""))
+            for m in meses:
+                mat[m] += r["qtd"] * r["est_prov"] / len(meses)
+    nomes = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"]
+    st.plotly_chart(px.bar(pd.DataFrame({"Mês": nomes, "R$": list(mat.values())}), x="Mês", y="R$",
+                            text_auto=".2f", title="Proventos estimados por mês"), use_container_width=True)
+    st.caption("Baseado nos proventos dos últimos 12 meses do Yahoo, agrupados pela data-com; o pagamento "
+                "costuma cair 0–2 meses depois. Valores são aproximados.")
+    if fallback:
+        st.caption(f"Sem histórico no Yahoo (distribuição genérica usada): {', '.join(fallback)}.")
+
+# ---- PROVENTOS RECEBIDOS
+with tabs[4]:
+    st.subheader("💰 Proventos recebidos")
+    c = st.columns(4)
+    p_at = c[0].selectbox("Ativo", [t.replace(".SA", "") for t in D["carteira"]], key="prov_at")
+    p_val = c[1].number_input("Valor líquido (R$)", min_value=0.01, value=1.00, step=0.5)
+    p_dat = c[2].date_input("Data", value=dt.date.today())
+    p_sobra = c[3].checkbox("Somar à sobra de aporte", value=True)
+    if st.button("Registrar provento"):
+        D["proventos"].append({"data": p_dat.isoformat(), "ativo": p_at, "valor": float(p_val)})
+        if p_sobra:
+            D["sobra"] = round(D["sobra"] + p_val, 2)
+        salvar()
+        st.rerun()
+    if D["proventos"]:
+        pv = pd.DataFrame(D["proventos"])
+        pv["mes"] = pv["data"].str[:7]
+        st.metric("Total recebido", brl(pv["valor"].sum()))
+        st.plotly_chart(px.bar(pv.groupby("mes")["valor"].sum().reset_index(), x="mes", y="valor",
+                                title="Recebido por mês"), use_container_width=True)
+        st.dataframe(pv.drop(columns="mes").iloc[::-1], hide_index=True, use_container_width=True)
+    else:
+        st.info("Nenhum provento registrado ainda.")
+
+# ---- FIRE
+with tabs[5]:
+    st.subheader("🔥 Independência financeira")
+    c = st.columns(4)
+    despesa = c[0].number_input("Custo de vida mensal (R$)", min_value=500.0, value=3000.0, step=500.0)
+    retorno = c[1].slider("Retorno real anual (%)", 3.0, 12.0, 6.0, 0.5) / 100
+    retirada = c[2].slider("Taxa de retirada (%)", 3.0, 8.0, 4.0, 0.5) / 100
+    anos = c[3].slider("Anos de projeção", 5, 40, 20)
+    alvo = despesa * 12 / retirada
+    st.info(f"🎯 Para viver de renda com **{brl(despesa)}/mês** retirando {retirada * 100:.1f}% ao ano, "
+            f"a meta é **{brl(alvo)}**. Hoje você tem {pat_ativos / alvo * 100:.2f}% disso e a renda "
+            f"estimada cobre {renda_anual / 12 / despesa * 100:.1f}% do custo de vida.")
+    tm, saldo_f, rows = (1 + retorno) ** (1 / 12) - 1, pat_ativos, []
+    for m in range(1, anos * 12 + 1):
+        saldo_f = saldo_f * (1 + tm) + aporte
+        rows.append({"Anos": round(m / 12, 2), "Patrimônio": saldo_f})
+    f = pd.DataFrame(rows)
+    ating = f[f["Patrimônio"] >= alvo]
+    st.metric("Tempo até a meta", f"{ating.iloc[0]['Anos']:.1f} anos" if len(ating)
+              else f"Não atinge em {anos} anos com aporte de {brl(aporte)}/mês")
+    fig = px.line(f, x="Anos", y="Patrimônio", title="Projeção com aportes mensais constantes")
+    fig.add_hline(y=alvo, line_dash="dash", line_color="red", annotation_text="Meta")
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption("Projeção simplificada: retorno real constante, aporte fixo, sem impostos. Não é garantia.")
+
+# ---- BOLA DE NEVE
+with tabs[6]:
+    st.subheader("❄️ Número mágico")
+    st.caption("Quantidade de cotas cujos proventos mensais pagam 1 cota nova por mês.")
+    bn = df[(df["meta_pct"] > 0) | (df["qtd"] > 0)][["nome", "qtd", "cotacao", "prov_mensal", "num_magico",
+                                                        "progresso"]]
+    bn.columns = ["Ativo", "Qtd atual", "Cotação", "Provento/mês por cota", "Número mágico", "Progresso (%)"]
+    st.dataframe(bn.round(2), use_container_width=True,
+                  column_config={"Progresso (%)": st.column_config.ProgressColumn(
+                      min_value=0, max_value=100, format="%.0f%%")})
+
+# ---- HISTÓRICO
+with tabs[7]:
+    h = pd.DataFrame(D["historico"])
+    if h.empty:
+        st.info("Nenhuma compra registrada.")
+    else:
+        h["total"] = h["qtd"] * h["preco"]
+        st.dataframe(h.iloc[::-1], use_container_width=True)
+        st.caption(f"Total investido via app: {brl(h['total'].sum())}")
+        st.download_button("📥 Baixar histórico (CSV)", h.to_csv(index=False), "historico.csv", "text/csv")
+        idx = st.selectbox("Desfazer lançamento", list(h.index[::-1]),
+                           format_func=lambda i: f"{h.at[i, 'data']} · {h.at[i, 'ativo']} · "
+                                                 f"{h.at[i, 'qtd']}x {brl(h.at[i, 'preco'])}")
+        if st.button("🗑️ Desfazer (recalcula quantidade e preço médio)"):
+            desfazer(int(idx))
+            salvar()
+            st.rerun()
+
+# ---- METAS
+with tabs[8]:
+    st.write("Edite metas e dados fundamentalistas. A soma das metas deve ser 100%.")
+    ed = st.data_editor(df[["nome", "setor", "meta_pct", "est_prov", "lpa", "vpa"]],
+                        disabled=["nome", "setor"], use_container_width=True, key="editor")
+    soma = ed["meta_pct"].sum()
+    (st.success if abs(soma - 100) < 0.01 else st.error)(f"Soma das metas: {soma:.1f}%")
+    if st.button("💾 Salvar alterações"):
+        for t, r in ed.iterrows():
+            D["carteira"][t].update(meta_pct=float(r.meta_pct), est_prov=float(r.est_prov),
+                                    lpa=float(r.lpa), vpa=float(r.vpa))
+        salvar()
+        st.rerun()
+    for m in alertas_concentracao():
+        st.warning("⚖️ " + m)
+    with st.expander("➕ Adicionar ativo"):
+        c = st.columns(5)
+        cod = c[0].text_input("Código (ex: VALE3)").upper().strip()
+        nm = c[1].text_input("Nome")
+        tp = c[2].selectbox("Tipo", ["Ação", "FII", "BDR"])
+        st_ = c[3].text_input("Setor")
+        mt = c[4].number_input("Meta (%)", 0.0, 100.0, 0.0)
+        if st.button("Adicionar"):
+            tk = f"{cod}.SA"
+            if not cod or tk in D["carteira"]:
+                st.error("Código vazio ou já existente.")
+            else:
+                D["carteira"][tk] = _a(nm or cod, tp, st_ or "Outros", mt, 0, 0.0, 0.0, 0.0, 0.0)
+                salvar()
+                st.rerun()
+        st.caption("Depois preencha proventos, LPA e VPA na tabela acima.")
+
+# ---- COPILOT
+with tabs[9]:
+    st.write("Pergunte sobre sua carteira. Requer `ANTHROPIC_API_KEY` nos *secrets* do Streamlit.")
+    q = st.text_area("Pergunta:")
+    if st.button("Analisar com IA") and q:
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+            ctx = df[["nome", "setor", "qtd", "cotacao", "valor_total", "meta_pct", "bazin", "graham", "pvp",
+                      "dy", "status"]].round(2).to_csv()
+            prompt_text = f"Disponível p/ aporte: {brl(disp)}\n{ctx}\n\n{q}"
+            r = client.messages.create(
+                model="claude-3-5-sonnet-20241022", max_tokens=1000,
+                system="Você analisa carteiras de investimento brasileiras. Use só os dados fornecidos, "
+                       "aponte riscos e limitações, e lembre que não é recomendação de investimento.",
+                messages=[{"role": "user", "content": prompt_text}])
+            st.markdown(r.content[0].text)
+        except Exception as e:
+            st.error(f"Não foi possível consultar a IA: {e}")
