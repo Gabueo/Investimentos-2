@@ -308,4 +308,3 @@ with tabs[0]:
                    "Comprar": f"{q} un.", "Preço": brl(df.at[t, "cotacao"]),
                    "Total": brl(q * df.at[t, "cotacao"])} for t, q in compras.items()]
         st.dataframe(pd.DataFrame(linhas), hide_index=True
-        
